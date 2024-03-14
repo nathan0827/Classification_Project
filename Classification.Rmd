@@ -1,0 +1,175 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Introduction
+
+This is the code of classification assignment
+
+Dataset: Hotels booked information
+In order to predict the prosibilities of the booking cancel or not
+Key column: "is_canceled"
+
+```{r}
+hotels0 <- readr::read_csv("https://www.louisaslett.com/Courses/MISCADA/hotels.csv")
+```
+
+# Data Plot
+
+```{r}
+install.packages("corrplot")
+library("corrplot")
+library("skimr")
+library("tidyverse")
+skim(hotels0)
+```
+
+```{r}
+DataExplorer::plot_bar(hotels0)
+```
+
+```{r}
+DataExplorer::plot_histogram(hotels0)
+```
+
+```{r}
+DataExplorer::plot_boxplot(hotels0, by = "is_canceled", ncol = 3)
+```	
+
+```{r}
+ggplot(hotels0, aes(x = adr)) + geom_density(fill = "blue", alpha = 0.5)
+```
+
+```{r}
+corr <- cor(hotels0 %>% select_if(is.numeric))
+corrplot(corr)
+```
+
+```{r}
+hotels <- hotels0 |>
+          select(-country, -reserved_room_type, -assigned_room_type, -agent, -company)
+```
+
+```{r}
+hotels <- hotels |>
+		  filter(adr < 4000) |>
+		  select(-reservation_status, -reservation_status_date) |>
+		  mutate(kids = case_when(
+				children + babies > 0 ~ "kids",
+				TRUE ~ "none")) |>
+		  select(-babies, -children) |>
+		  mutate(parking = case_when(
+				required_car_parking_spaces > 0 ~ "parking",
+				TRUE ~ "none")) |>
+		  select(-required_car_parking_spaces) |>
+		  mutate(total_nights = stays_in_weekend_nights+stays_in_week_nights) |>
+		  select(-stays_in_weekend_nights, -stays_in_week_nights) |>
+		  mutate(is_canceled = as.factor(is_canceled))
+```
+
+```{r}
+hotels <- hotels %>% mutate_if(is.character, as.factor)
+```
+
+```{r}
+library("mlr3")
+library("mlr3learners")
+library("data.table")
+library("mlr3verse")
+```
+
+```{r}
+set.seed(212) # set seed for reproducibility
+
+cancel_task <- TaskClassif$new(id = "cancel",
+							   backend = hotels,
+                               target = "is_canceled",
+                               positive = '1')
+```
+
+```{r}
+cv5 <- rsmp("cv", folds = 5)
+cv5$instantiate(cancel_task)
+```
+
+```{r}
+lrn_baseline <- lrn("classif.featureless", predict_type = "prob")
+lrn_cart     <- lrn("classif.rpart", predict_type = "prob")
+lrn_cart_cp  <- lrn("classif.rpart", predict_type = "prob", cp = 0.016, id = "cartcp")
+lrn_naive_bayes  <- lrn("classif.naive_bayes", predict_type = "prob")
+lrn_xgboost  <- lrn("classif.xgboost", predict_type = "prob")
+```
+
+
+#Different Learner
+```{r}
+library(mlr3misc)
+
+lrn_xgboost1 <- po("encode") %>>% po(lrn_xgboost)
+res <- benchmark(data.table(
+  task       = list(cancel_task),
+  learner    = list(lrn_baseline,
+                    lrn_cart,
+					lrn_cart_cp,
+                    lrn_naive_bayes,
+                    lrn_xgboost1),
+  resampling = list(cv5)
+  ), store_models = TRUE)
+  
+res$aggregate(list(msr("classif.ce"),
+                   msr("classif.acc"),
+                   msr("classif.auc"),
+                   msr("classif.fpr"),
+                   msr("classif.fnr")))
+```
+
+
+#Super Learner
+```{r}
+lrnsp_log_reg <- lrn("classif.log_reg", predict_type = "prob", id = "super")
+```
+
+```{r}
+pl_missing <- po("fixfactors") %>>%
+  po("removeconstants") %>>%
+  po("imputesample", affect_columns = selector_type(c("ordered", "factor"))) %>>%
+  po("imputemean")
+
+pl_factor <- po("encode")
+```
+
+```{r}
+spr_lrn <- gunion(list(
+  # First group of learners requiring no modification to input
+  gunion(list(
+    po("learner_cv", lrn_baseline),
+    po("learner_cv", lrn_cart),
+    po("learner_cv", lrn_cart_cp)
+  )),
+  # Next group of learners requiring special treatment of missingness
+  pl_missing %>>%
+    gunion(list(
+      po("learner_cv", lrn_naive_bayes),
+      po("nop") # This passes through the original features adjusted for
+                # missingness to the super learner
+    )),
+  # Last group needing factor encoding
+  pl_factor %>>%
+    po("learner_cv", lrn_xgboost)
+)) %>>%
+  po("featureunion") %>>%
+  po(lrnsp_log_reg)
+```
+
+```{r}
+spr_lrn$plot()
+
+# Finally fit the base learners and super learner and evaluate
+res_spr <- resample(cancel_task, spr_lrn, cv5, store_models = TRUE)
+res_spr$aggregate(list(msr("classif.ce"),
+                       msr("classif.acc"),
+                       msr("classif.auc"),
+                       msr("classif.fpr"),
+                       msr("classif.fnr")))
+```
